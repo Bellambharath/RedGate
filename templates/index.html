@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>GenAI Row Count Validator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🤖 GenAI Row Count Validator</h1>
+      <p>Intelligent data validation with machine learning predictions</p>
+    </div>
+
+    <div class="main-content">
+      <div class="form-section">
+
+        <!-- DB selection -->
+        <div class="form-group">
+          <label>Database Selection</label>
+          <div class="database-grid">
+            <div class="input-wrapper">
+              <select id="sourceDb">
+                <option value="">Select Source DB</option>
+              </select>
+              <span class="input-icon">🗄️</span>
+            </div>
+            <div class="input-wrapper">
+              <select id="targetDb">
+                <option value="">Select Target DB</option>
+              </select>
+              <span class="input-icon">🎯</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Source Table -->
+        <div class="form-group">
+          <label for="sourceTableSelect">Source Table</label>
+          <div class="input-wrapper">
+            <select id="sourceTableSelect">
+              <option value="">Choose a source table</option>
+            </select>
+            <span class="input-icon">📊</span>
+          </div>
+        </div>
+
+        <!-- Target Table -->
+        <div class="form-group">
+          <label for="targetTableSelect">Target Table</label>
+          <div class="input-wrapper">
+            <select id="targetTableSelect">
+              <option value="">Choose a target table</option>
+            </select>
+            <span class="input-icon">📊</span>
+          </div>
+        </div>
+
+        <!-- Prompt -->
+        <div class="form-group">
+          <label for="prompt">Validation Condition</label>
+          <div class="input-wrapper">
+            <input type="text" id="prompt" placeholder="e.g., rows where status = 'active' and date > '2023-01-01'" />
+            <span class="input-icon">🔍</span>
+          </div>
+        </div>
+
+        <button class="submit-btn" id="submitBtn">
+          <span class="loading-spinner" id="loadingSpinner"></span>
+          <span id="submitText">🚀 Validate Row Counts</span>
+        </button>
+
+      </div>
+
+      <div class="result-section" id="resultSection">
+        <div class="result-placeholder" id="resultPlaceholder">
+          <div class="result-placeholder-icon">📈</div>
+          <div>Results will appear here after validation</div>
+        </div>
+
+        <div class="result-content" id="resultContent">
+          <div class="result-header">
+            <div class="result-title">Validation Results</div>
+            <div class="result-status" id="resultStatus">Success</div>
+          </div>
+
+          <div class="metrics-grid">
+            <div class="metric-card">
+              <div class="metric-label">Source Count</div>
+              <div class="metric-value" id="sourceCount">-</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Target Count</div>
+              <div class="metric-value" id="targetCount">-</div>
+            </div>
+          </div>
+
+          <div class="prediction-section">
+            <div class="prediction-title">🔮 AI Predictions</div>
+            <div class="prediction-grid">
+              <div class="prediction-item">
+                <span>LSTM Forecast:</span>
+                <strong id="lstmPrediction">-</strong>
+              </div>
+              <div class="prediction-item">
+                <span>ARIMA Forecast:</span>
+                <strong id="arimaPrediction">-</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="summary-section">
+            <div class="summary-title">📝 AI Analysis</div>
+            <div class="summary-text" id="summaryText">Analysis will appear here...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
