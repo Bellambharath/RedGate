@@ -9,6 +9,7 @@ import json
 import requests
 import pandas as pd
 import numpy as np
+import re
 
 from datetime import datetime
 from urllib.parse import quote_plus
@@ -20,20 +21,18 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import IsolationForest
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
 # ─── CONFIG & LOGGING ─────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(__file__)
-# Local SQLite file used in sqlite mode
 CONFIG_DB  = os.path.join(BASE_DIR, "sample.db")
-ServerName = "MSSQL_SERVER"
-
 os.environ["SSL_CERT_FILE"] = certifi.where()
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load .env for any other settings (optional)
+# Load env (you used ATT92742.env previously)
 load_dotenv("ATT92742.env")
 
 # ─── SQLITE/CONFIG BOOTSTRAP ──────────────────────────────────────────────────
@@ -56,7 +55,10 @@ def ensure_config_db(db_path: str = CONFIG_DB):
     VALUES (?, ?)
     ON CONFLICT(key) DO NOTHING;
     """, [
-      ("MSSQL_SERVER",    "6R312S3"),
+      ("MSSQL_SERVER",    "localhost"),
+      ("MSSQL_USER",      ""),
+      ("MSSQL_PASS",      ""),
+      ("MSSQL_DB",        "master"),
       ("LOG_DB",          "your_log_database_name"),
       ("HISTORY_DB_NAME", "master"),
       ("DB_MODE",         "sqlite"),   # 'sqlite' or 'mssql'
@@ -75,7 +77,6 @@ def get_config_value(key: str, db_path: str = CONFIG_DB) -> str | None:
 # initialize config if missing
 ensure_config_db()
 
-# small helper to get runtime DB mode
 def get_db_mode() -> str:
     # priority: config table -> env var -> default sqlite
     return (get_config_value("DB_MODE") or os.getenv("DB_MODE") or "sqlite").lower()
@@ -84,7 +85,45 @@ def get_db_mode() -> str:
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
 
-# ─── DATABASE CONNECTION HELPERS ───────────────────────────────────────────────
+# ─── SAFE IDENTIFIERS (basic check to avoid injection in identifiers) ──────────
+def _safe_identifier(name: str) -> str:
+    """
+    Allow only basic alphanumeric + underscore characters for table/database names.
+    Raises ValueError for anything unsafe.
+    """
+    if not name or not re.match(r'^[A-Za-z0-9_]+$', name):
+        raise ValueError("Invalid identifier. Only A-Z, a-z, 0-9 and underscore allowed.")
+    return name
+
+
+
+def _build_mssql_conn_str(db_name: str | None = None) -> str:
+    # read server/creds from config or env (same as before)
+    server = get_config_value("MSSQL_SERVER") or os.getenv("MSSQL_SERVER")
+    if not server:
+        raise ValueError("MSSQL_SERVER not set in config or environment for mssql mode")
+    default_db = db_name or (get_config_value("MSSQL_DB") or os.getenv("MSSQL_DB") or "master")
+    user = get_config_value("MSSQL_USER") or os.getenv("MSSQL_USER")
+    pwd  = get_config_value("MSSQL_PASS") or os.getenv("MSSQL_PASS")
+
+    # If you want to override driver name from env/config, you can add MSSQL_DRIVER key.
+    driver_name = get_config_value("MSSQL_DRIVER") or os.getenv("MSSQL_DRIVER") or "ODBC Driver 17 for SQL Server"
+
+    # Build the exact ODBC string (braces kept around driver)
+    if user and pwd:
+        odbc_str = (
+            f"DRIVER={{{driver_name}}};"
+            f"SERVER={server};DATABASE={default_db};UID={user};PWD={pwd};"
+        )
+    else:
+        odbc_str = (
+            f"DRIVER={{{driver_name}}};"
+            f"SERVER={server};DATABASE={default_db};Trusted_Connection=yes;"
+        )
+
+    # URL-encode the whole ODBC string and return SQLAlchemy URI using odbc_connect
+    return "mssql+pyodbc:///?odbc_connect=" + quote_plus(odbc_str)
+
 def connect_to_server():
     """
     Returns a SQLAlchemy engine:
@@ -93,21 +132,7 @@ def connect_to_server():
     """
     mode = get_db_mode()
     if mode == "mssql":
-        # build MS SQL engine to a default DB (use MASTER or configured DB)
-        server = get_config_value("MSSQL_SERVER") or os.getenv("MSSQL_SERVER")
-        if not server:
-            raise ValueError("MSSQL_SERVER not set in config or environment for mssql mode")
-
-        default_db = get_config_value("MSSQL_DB") or os.getenv("MSSQL_DB") or "master"
-        user = get_config_value("MSSQL_USER") or os.getenv("MSSQL_USER")
-        pwd  = get_config_value("MSSQL_PASS") or os.getenv("MSSQL_PASS")
-
-        driver = quote_plus("{ODBC Driver 17 for SQL Server}")  # ensure driver exists on machine
-        if user and pwd:
-            conn_str = f"mssql+pyodbc://{user}:{pwd}@{server}/{default_db}?driver={driver}"
-        else:
-            conn_str = f"mssql+pyodbc://{server}/{default_db}?trusted_connection=yes&driver={driver}"
-
+        conn_str = _build_mssql_conn_str("master")
         engine = create_engine(conn_str, pool_timeout=30, pool_recycle=3600)
         # basic smoke test
         try:
@@ -116,7 +141,7 @@ def connect_to_server():
         except Exception as e:
             logger.error(f"MS SQL connect test failed: {e}")
             raise
-        logger.info(f"Connected to MSSQL server {server} (db={default_db})")
+        logger.info(f"Connected to MSSQL server { (get_config_value('MSSQL_SERVER') or os.getenv('MSSQL_SERVER')) } (db=master)")
         return engine
 
     # default sqlite
@@ -126,23 +151,15 @@ def connect_to_server():
 
 def connect_to_database(db_name: str):
     """
-    Returns an engine to a specific database:
+    Returns engine to a specific database:
       - sqlite: returns the same engine (we only use one file)
       - mssql: returns engine targetting the requested database name on the server
     """
     mode = get_db_mode()
     if mode == "mssql":
-        server = get_config_value("MSSQL_SERVER") or os.getenv("MSSQL_SERVER")
-        if not server:
-            raise ValueError("MSSQL_SERVER not set for mssql mode")
-        user = get_config_value("MSSQL_USER") or os.getenv("MSSQL_USER")
-        pwd  = get_config_value("MSSQL_PASS") or os.getenv("MSSQL_PASS")
-        driver = quote_plus("{ODBC Driver 17 for SQL Server}")
-        if user and pwd:
-            conn_str = f"mssql+pyodbc://{user}:{pwd}@{server}/{db_name}?driver={driver}"
-        else:
-            conn_str = f"mssql+pyodbc://{server}/{db_name}?trusted_connection=yes&driver={driver}"
-
+        # validate db_name
+        _safe_identifier(db_name)
+        conn_str = _build_mssql_conn_str(db_name)
         engine = create_engine(conn_str, pool_timeout=30, pool_recycle=3600)
         try:
             with engine.connect() as conn:
@@ -150,7 +167,7 @@ def connect_to_database(db_name: str):
         except Exception as e:
             logger.error(f"MS SQL connect to DB '{db_name}' failed: {e}")
             raise
-        logger.info(f"Connected to MSSQL database: {db_name} on {server}")
+        logger.info(f"Connected to MSSQL database: {db_name}")
         return engine
 
     # sqlite mode: single file
@@ -159,13 +176,17 @@ def connect_to_database(db_name: str):
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # If you have an index template this will render; otherwise you can return simple text
+    try:
+        return render_template("index.html")
+    except Exception:
+        return "Row count validation API is running."
 
 @app.route("/api/databases", methods=["GET"])
 def get_databases_endpoint():
     """
     For sqlite mode: return single logical DB name (filename).
-    For mssql mode: return server databases (like original).
+    For mssql mode: return server databases.
     """
     try:
         mode = get_db_mode()
@@ -239,8 +260,11 @@ def get_columns_endpoint():
         logger.error(f"Error fetching columns: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ─── SQL HELPERS ───────────────────────────────────────────────────────────────
+# ─── SQL HELPERS ─────────────────────────────────────────────────────────────
 def generate_where_clause(prompt: str) -> str:
+    """
+    Uses Gemini (if API key present) to generate a WHERE clause. Fallback to WHERE 1=1.
+    """
     try:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -270,14 +294,14 @@ def get_row_count(engine, table_name, where_clause):
       - mssql : [table]
     """
     mode = get_db_mode()
+    # validate table_name
+    _safe_identifier(table_name)
     if mode == "mssql":
         q = f"SELECT COUNT(*) as count FROM [{table_name}] {where_clause}"
     else:
-        # double-quote identifier for sqlite
         q = f'SELECT COUNT(*) as count FROM "{table_name}" {where_clause}'
     with engine.connect() as conn:
         result = conn.execute(text(q))
-        # .scalar() may return None, so coerce to int safely
         val = result.scalar()
         return int(val or 0)
 
@@ -292,7 +316,7 @@ def get_historical_data(source_db, source_table, target_db, target_table, where_
         engine = connect_to_database(history_db)
         mode = get_db_mode()
         if mode == "mssql":
-            query = text("""
+            query = text(""" 
                 SELECT TOP 5 SourceRowCount, TargetRowCount
                 FROM ETL_RowCount_Log
                 WHERE SourceDatabase = :source_db
@@ -355,7 +379,11 @@ def log_validation_result(source_db, source_table, target_db, target_table, sour
                 'where_clause': where_clause,
                 'is_anomaly': int(bool(is_anomaly))
             })
-            conn.commit()
+            # commit for some dialects
+            try:
+                conn.commit()
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Error logging validation result: {e}")
 
