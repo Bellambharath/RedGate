@@ -21,69 +21,67 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import IsolationForest
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
-from urllib.parse import quote_plus
 
 # ─── CONFIG & LOGGING ─────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(__file__)
-CONFIG_DB  = os.path.join(BASE_DIR, "sample.db")
+CONFIG_DB  = os.path.join(BASE_DIR, "sample.db")  # only used if the file already exists
+
+# Fallback MSSQL server from your SSMS screenshot. Code prefers env/config first.
+# DEFAULT_MSSQL_SERVER = r"2S3Q7R3\MSSQLSERVER1"
+
+DEFAULT_MSSQL_SERVER = r"DESKTOP-GSJB5GJ"
+
+
 os.environ["SSL_CERT_FILE"] = certifi.where()
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load env (you used ATT92742.env previously)
+# Load env (optional)
 load_dotenv("ATT92742.env")
 
-# ─── SQLITE/CONFIG BOOTSTRAP ──────────────────────────────────────────────────
-def ensure_config_db(db_path: str = CONFIG_DB):
-    """
-    Create config table and seed default keys if missing.
-    Safe to run every startup.
-    """
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS config (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    """)
-    # seed defaults (won't overwrite existing)
-    cur.executemany("""
-    INSERT INTO config(key, value)
-    VALUES (?, ?)
-    ON CONFLICT(key) DO NOTHING;
-    """, [
-      ("MSSQL_SERVER",    "localhost"),
-      ("MSSQL_USER",      ""),
-      ("MSSQL_PASS",      ""),
-      ("MSSQL_DB",        "master"),
-      ("LOG_DB",          "your_log_database_name"),
-      ("HISTORY_DB_NAME", "master"),
-      ("DB_MODE",         "sqlite"),   # 'sqlite' or 'mssql'
-    ])
-    conn.commit()
-    conn.close()
+# Note: startup no longer creates/initializes any local DB files or config entries.
+# Configuration is read from environment variables first; if sample.db exists, we may read from it (read-only).
 
-def get_config_value(key: str, db_path: str = CONFIG_DB) -> str | None:
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-    cur.execute("SELECT value FROM config WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
 
-# initialize config if missing
-ensure_config_db()
+def get_config_value(key: str) -> str | None:
+    """
+    Read configuration value from environment first.
+    If not present and sample.db exists, read from its config table (read-only).
+    Do NOT create or modify sample.db here.
+    """
+    # 1) environment variable (highest priority)
+    val = os.getenv(key)
+    if val is not None and val != "":
+        return val
+
+    # 2) sample.db (only if file exists) - read-only
+    if os.path.exists(CONFIG_DB):
+        try:
+            conn = sqlite3.connect(CONFIG_DB)
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM config WHERE key = ?", (key,))
+            row = cur.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except Exception as e:
+            logger.debug(f"Failed to read {key} from sample.db: {e}")
+            return None
+
+    # 3) not found
+    return None
+
 
 def get_db_mode() -> str:
-    # priority: config table -> env var -> default sqlite
-    return (get_config_value("DB_MODE") or os.getenv("DB_MODE") or "sqlite").lower()
+    # priority: env -> sample.db (if present) -> default mssql
+    return (get_config_value("DB_MODE") or "mssql").lower()
+
 
 # ─── FLASK SETUP ───────────────────────────────────────────────────────────────
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
+
 
 # ─── SAFE IDENTIFIERS (basic check to avoid injection in identifiers) ──────────
 def _safe_identifier(name: str) -> str:
@@ -96,20 +94,19 @@ def _safe_identifier(name: str) -> str:
     return name
 
 
-
 def _build_mssql_conn_str(db_name: str | None = None) -> str:
-    # read server/creds from config or env (same as before)
-    server = get_config_value("MSSQL_SERVER") or os.getenv("MSSQL_SERVER")
-    if not server:
-        raise ValueError("MSSQL_SERVER not set in config or environment for mssql mode")
-    default_db = db_name or (get_config_value("MSSQL_DB") or os.getenv("MSSQL_DB") or "master")
-    user = get_config_value("MSSQL_USER") or os.getenv("MSSQL_USER")
-    pwd  = get_config_value("MSSQL_PASS") or os.getenv("MSSQL_PASS")
+    """
+    Build a SQLAlchemy pyodbc connection string for MSSQL.
+    Prefers environment variables; if missing falls back to DEFAULT_MSSQL_SERVER.
+    """
+    server = get_config_value("MSSQL_SERVER") or DEFAULT_MSSQL_SERVER
+    default_db = db_name or (get_config_value("MSSQL_DB") or "master")
+    user = get_config_value("MSSQL_USER") or None
+    pwd  = get_config_value("MSSQL_PASS") or None
 
-    # If you want to override driver name from env/config, you can add MSSQL_DRIVER key.
-    driver_name = get_config_value("MSSQL_DRIVER") or os.getenv("MSSQL_DRIVER") or "ODBC Driver 17 for SQL Server"
+    # Optional driver override
+    driver_name = get_config_value("MSSQL_DRIVER") or "ODBC Driver 17 for SQL Server"
 
-    # Build the exact ODBC string (braces kept around driver)
     if user and pwd:
         odbc_str = (
             f"DRIVER={{{driver_name}}};"
@@ -121,14 +118,15 @@ def _build_mssql_conn_str(db_name: str | None = None) -> str:
             f"SERVER={server};DATABASE={default_db};Trusted_Connection=yes;"
         )
 
-    # URL-encode the whole ODBC string and return SQLAlchemy URI using odbc_connect
     return "mssql+pyodbc:///?odbc_connect=" + quote_plus(odbc_str)
+
 
 def connect_to_server():
     """
     Returns a SQLAlchemy engine:
-      - sqlite mode -> engine pointed at CONFIG_DB file
-      - mssql  mode -> engine connected to MSSQL server 'master' (or configured default DB)
+      - mssql mode -> engine connected to MSSQL server 'master' (or configured default DB)
+      - sqlite fallback -> engine pointed at existing CONFIG_DB (only if present)
+    No database creation or modification is performed here.
     """
     mode = get_db_mode()
     if mode == "mssql":
@@ -141,23 +139,26 @@ def connect_to_server():
         except Exception as e:
             logger.error(f"MS SQL connect test failed: {e}")
             raise
-        logger.info(f"Connected to MSSQL server { (get_config_value('MSSQL_SERVER') or os.getenv('MSSQL_SERVER')) } (db=master)")
+        logger.info(f"Connected to MSSQL server { (get_config_value('MSSQL_SERVER') or DEFAULT_MSSQL_SERVER) } (db=master)")
         return engine
 
-    # default sqlite
-    uri = f"sqlite:///{CONFIG_DB}"
-    engine = create_engine(uri, connect_args={"check_same_thread": False})
-    return engine
+    # sqlite fallback only if file exists
+    if os.path.exists(CONFIG_DB):
+        uri = f"sqlite:///{CONFIG_DB}"
+        engine = create_engine(uri, connect_args={"check_same_thread": False})
+        return engine
+
+    raise RuntimeError("No valid database configuration found (DB_MODE not 'mssql' and sample.db missing)")
+
 
 def connect_to_database(db_name: str):
     """
-    Returns engine to a specific database:
-      - sqlite: returns the same engine (we only use one file)
+    Return engine to a specific database name:
       - mssql: returns engine targetting the requested database name on the server
+      - sqlite: returns engine if CONFIG_DB exists
     """
     mode = get_db_mode()
     if mode == "mssql":
-        # validate db_name
         _safe_identifier(db_name)
         conn_str = _build_mssql_conn_str(db_name)
         engine = create_engine(conn_str, pool_timeout=30, pool_recycle=3600)
@@ -170,23 +171,27 @@ def connect_to_database(db_name: str):
         logger.info(f"Connected to MSSQL database: {db_name}")
         return engine
 
-    # sqlite mode: single file
-    return connect_to_server()
+    # sqlite fallback only if file exists
+    if os.path.exists(CONFIG_DB):
+        return connect_to_server()
+
+    raise RuntimeError("SQLite DB not found and DB_MODE is not mssql.")
+
 
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    # If you have an index template this will render; otherwise you can return simple text
     try:
         return render_template("index.html")
     except Exception:
         return "Row count validation API is running."
 
+
 @app.route("/api/databases", methods=["GET"])
 def get_databases_endpoint():
     """
-    For sqlite mode: return single logical DB name (filename).
     For mssql mode: return server databases.
+    For sqlite fallback: return filename as logical DB.
     """
     try:
         mode = get_db_mode()
@@ -197,7 +202,6 @@ def get_databases_endpoint():
                 df = pd.read_sql(query, conn)
             return jsonify(df['name'].tolist())
         else:
-            # sqlite -> return filename as logical DB
             return jsonify([os.path.basename(CONFIG_DB)])
     except Exception as e:
         logger.error(f"Error fetching databases: {e}")
@@ -207,8 +211,8 @@ def get_databases_endpoint():
 @app.route("/api/tables", methods=["POST"])
 def get_tables_endpoint():
     """
-    For sqlite: return list of tables in the single file.
     For mssql: given a database name (posted), return its table names.
+    For sqlite fallback: list tables from sqlite_master (only if file exists).
     """
     try:
         data = request.get_json()
@@ -219,12 +223,12 @@ def get_tables_endpoint():
         posted_db = data["database"]
 
         if mode == "mssql":
-            # posted_db is expected to be the database name on the server
             engine = connect_to_database(posted_db)
             inspector = inspect(engine)
             return jsonify(inspector.get_table_names())
         else:
-            # sqlite: list tables from sqlite_master
+            if not os.path.exists(CONFIG_DB):
+                return jsonify({"error": "SQLite DB not available"}), 500
             engine = connect_to_server()
             query = """
               SELECT name
@@ -245,7 +249,6 @@ def get_tables_endpoint():
 def get_columns_endpoint():
     """
     Given {"table": "<table_name>"} return column list for that table.
-    Useful for UI to show column selection separately.
     """
     try:
         data = request.get_json()
@@ -259,6 +262,7 @@ def get_columns_endpoint():
     except Exception as e:
         logger.error(f"Error fetching columns: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 # ─── SQL HELPERS ─────────────────────────────────────────────────────────────
 def generate_where_clause(prompt: str) -> str:
@@ -290,11 +294,10 @@ def generate_where_clause(prompt: str) -> str:
 def get_row_count(engine, table_name, where_clause):
     """
     Use DB-specific quoting for table name:
-      - sqlite: "table"
       - mssql : [table]
+      - sqlite: "table"
     """
     mode = get_db_mode()
-    # validate table_name
     _safe_identifier(table_name)
     if mode == "mssql":
         q = f"SELECT COUNT(*) as count FROM [{table_name}] {where_clause}"
@@ -368,7 +371,8 @@ def log_validation_result(source_db, source_table, target_db, target_table, sour
             VALUES (:source_db, :source_table, :target_db, :target_table,
                     :source_count, :target_count, :where_clause, :is_anomaly)
         """)
-        with engine.connect() as conn:
+        # use a transactional connection for writes
+        with engine.begin() as conn:
             conn.execute(query, {
                 'source_db': source_db,
                 'source_table': source_table,
@@ -379,11 +383,6 @@ def log_validation_result(source_db, source_table, target_db, target_table, sour
                 'where_clause': where_clause,
                 'is_anomaly': int(bool(is_anomaly))
             })
-            # commit for some dialects
-            try:
-                conn.commit()
-            except Exception:
-                pass
     except Exception as e:
         logger.error(f"Error logging validation result: {e}")
 
@@ -517,9 +516,9 @@ def internal_error(error):
 
 
 if __name__ == '__main__':
-    # quick preflight: ensure DB_MODE exists in config
     logger.info(f"Starting app in DB_MODE={get_db_mode()}")
-    if get_db_mode() == "mssql" and not (get_config_value("MSSQL_SERVER") or os.getenv("MSSQL_SERVER")):
-        print("Please set MSSQL_SERVER in config table or as environment variable for mssql mode.")
+    # Accept DEFAULT_MSSQL_SERVER as valid fallback:
+    if get_db_mode() == "mssql" and not (get_config_value("MSSQL_SERVER") or DEFAULT_MSSQL_SERVER):
+        print("Please set MSSQL_SERVER in environment if you do not want to use the default fallback server.")
     else:
         app.run(debug=True, host='0.0.0.0', port=5000)
