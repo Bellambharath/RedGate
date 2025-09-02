@@ -177,7 +177,7 @@ def connect_to_database(db_name: str):
 
     raise RuntimeError("SQLite DB not found and DB_MODE is not mssql.")
 
-
+ 
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -225,7 +225,15 @@ def get_tables_endpoint():
         if mode == "mssql":
             engine = connect_to_database(posted_db)
             inspector = inspect(engine)
-            return jsonify(inspector.get_table_names())
+            # Get all schemas
+            schemas = inspector.get_schema_names()
+            # Fetch tables for each schema
+            all_tables = []
+            for schema in schemas:
+                for table in inspector.get_table_names(schema=schema):
+                    all_tables.append(f"{schema}.{table}")
+
+            return jsonify(all_tables)
         else:
             if not os.path.exists(CONFIG_DB):
                 return jsonify({"error": "SQLite DB not available"}), 500
@@ -383,6 +391,7 @@ def log_validation_result(source_db, source_table, target_db, target_table, sour
                 'where_clause': where_clause,
                 'is_anomaly': int(bool(is_anomaly))
             })
+        logger.info(f"{history_db}-added info logs ")
     except Exception as e:
         logger.error(f"Error logging validation result: {e}")
 

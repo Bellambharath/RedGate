@@ -24,6 +24,7 @@ document.addEventListener("DOMContentLoaded", () => {
       clearTimeout(timeoutId);
       return response;
     } catch (error) {
+      console.log("error at the begning result:", error);
       clearTimeout(timeoutId);
       if (error.name === 'AbortError') {
         throw new Error('Request timed out. Please try again.');
