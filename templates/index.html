@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -12,62 +12,53 @@
   <div class="app-bg">
     <div class="container card">
 
-      <h1>🤖 GenAI Row Count Validator</h1>
+      <h1>GenAI Row Count Validator</h1>
 
-      <!-- DB SELECTION -->
       <div class="form-grid">
         <div class="form-group">
-          <label>Source DB</label>
+          <label for="sourceDb">Source DB</label>
           <select id="sourceDb">
             <option value="">Select Source DB</option>
           </select>
         </div>
 
         <div class="form-group">
-          <label>Target DB</label>
+          <label for="targetDb">Target DB</label>
           <select id="targetDb">
             <option value="">Select Target DB</option>
           </select>
         </div>
-      </div>
 
-      <!-- TABLE BROWSER -->
-      <div class="table-browser">
-        <div class="table-grid">
-          <div>
-            <h3>📂 Source Tables</h3>
-            <p class="muted">Click to copy</p>
-            <div id="sourceTableList" class="table-list"></div>
-          </div>
-      
-          <div>
-            <h3>📂 Target Tables</h3>
-            <p class="muted">Click to copy</p>
-            <div id="targetTableList" class="table-list"></div>
-          </div>
+        <div class="form-group">
+          <label for="sourceTable">Source Table</label>
+          <select id="sourceTable" disabled>
+            <option value="">Select Source Table</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="targetTable">Target Table</label>
+          <select id="targetTable" disabled>
+            <option value="">Select Target Table</option>
+          </select>
         </div>
       </div>
-      
 
-      <!-- PROMPT -->
-      <label for="prompt">Validation Condition</label>
+      <label for="prompt">Validation Question</label>
       <textarea id="prompt" rows="4"
-        placeholder="e.g. Compare dbo.employees and dbo.country where date_of_birth is null">
+        placeholder="e.g. Compare rows where OrderDate >= '2014-01-01'">
       </textarea>
 
-      <!-- SUBMIT -->
-      <button id="submitBtn" class="primary-btn">🚀 Validate Row Counts</button>
+      <button id="submitBtn" class="primary-btn">Validate Row Counts</button>
 
-      <!-- RESULTS -->
       <div id="resultSection">
-        <div id="resultPlaceholder" class="muted">Results will appear here</div>
+        <div id="resultPlaceholder" class="muted">Results will appear here.</div>
         <div id="resultContent"></div>
       </div>
 
     </div>
   </div>
 
-  <!-- JS -->
   <script src="{{ url_for('static', filename='script.js') }}"></script>
 </body>
 </html>

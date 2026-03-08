@@ -1,707 +1,433 @@
-# app.py
-import os
-import sqlite3
-import certifi
-import warnings
+﻿import os
 import logging
 import traceback
-import pandas as pd
+import re
 from urllib.parse import quote_plus
+
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import create_engine, inspect, text
-from urllib3.exceptions import InsecureRequestWarning
-import openai
-import re 
 from dotenv import load_dotenv
+from openai import OpenAI
 
-# ─── CONFIG & LOGGING ─────────────────────────────────────────────────────────
-logger = logging.getLogger(__name__)
-BASE_DIR   = os.path.dirname(__file__)
-CONFIG_DB  = os.path.join(BASE_DIR, "sample.db")  # only used if the file already exists
+DEFAULT_MSSQL_SERVER = "localhost"
+DEFAULT_db = "AdventureWorks2022"
+DEFAULT_DRIVER = "ODBC Driver 17 for SQL Server"
+DEFAULT_MODEL = "gpt-4o-mini"
 
-# Fallback MSSQL server from your SSMS screenshot. Code prefers env/config first.
-# DEFAULT_MSSQL_SERVER = r"2S3Q7R3\MSSQLSERVER1"
-
-DEFAULT_MSSQL_SERVER = r"DESKTOP-GSJB5GJ"
-
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
-warnings.filterwarnings("ignore", category=InsecureRequestWarning)
-
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# Load env (optional)
-load_dotenv("ATT92742.env")
-
-# Note: startup no longer creates/initializes any local DB files or config entries.
-# Configuration is read from environment variables first; if sample.db exists, we may read from it (read-only).
-
-def get_config_value(key: str) -> str | None:
-    """
-    Read configuration value from environment first.
-    If not present and sample.db exists, read from its config table (read-only).
-    Do NOT create or modify sample.db here.
-    """
-    # 1) environment variable (highest priority)
-    val = os.getenv(key)
-    if val is not None and val != "":
-        return val
-
-    # 2) sample.db (only if file exists) - read-only
-    if os.path.exists(CONFIG_DB):
-        try:
-            conn = sqlite3.connect(CONFIG_DB)
-            cur = conn.cursor()
-            cur.execute("SELECT value FROM config WHERE key = ?", (key,))
-            row = cur.fetchone()
-            conn.close()
-            return row[0] if row else None
-        except Exception as e:
-            logger.debug(f"Failed to read {key} from sample.db: {e}")
-            return None
-
-    # 3) not found
-    return None
-
-
-def get_db_mode() -> str:
-    # priority: env -> sample.db (if present) -> default mssql
-    return (get_config_value("DB_MODE") or "mssql").lower()
-
-
-# ─── FLASK SETUP ───────────────────────────────────────────────────────────────
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
 
 
-# ─── SAFE IDENTIFIERS (basic check to avoid injection in identifiers) ──────────
-def _safe_identifier(name: str) -> str:
-    """
-    Allow only basic alphanumeric + underscore characters for table/database names.
-    Raises ValueError for anything unsafe.
-    """
-    # if not name or not re.match(r'^[A-Za-z0-9_]+$', name):
-    #     raise ValueError("Invalid identifier. Only A-Z, a-z, 0-9 and underscore allowed.")
-    return name
+def cfg(key: str) -> str | None:
+    v = os.getenv(key)
+    return v if v not in (None, "") else None
 
 
-def _build_mssql_conn_str(db_name: str | None = None) -> str:
-    """
-    Build a SQLAlchemy pyodbc connection string for MSSQL.
-    Prefers environment variables; if missing falls back to DEFAULT_MSSQL_SERVER.
-    """
-    server = get_config_value("MSSQL_SERVER") or DEFAULT_MSSQL_SERVER
-    default_db = db_name or (get_config_value("MSSQL_DB") or "master")
-    user = get_config_value("MSSQL_USER") or None
-    pwd  = get_config_value("MSSQL_PASS") or None
+def clean_server(server: str) -> str:
+    s = server.strip()
+    if s.endswith("/"):
+        s = s[:-1]
+    return s.replace("/", "\\")
 
-    # Optional driver override
-    driver_name = get_config_value("MSSQL_DRIVER") or "ODBC Driver 17 for SQL Server"
+
+def tbl_ref(db: str, schema: str, table: str) -> str:
+    return f"[{db}].[{schema}].[{table}]"
+
+
+def llm_client():
+    key = cfg("OPENAI_API_KEY")
+    if not key:
+        return None
+    return OpenAI(api_key=key)
+
+
+def mk_conn_str(db_name: str | None = None) -> str:
+    server = clean_server(cfg("MSSQL_SERVER") or DEFAULT_MSSQL_SERVER)
+    dbName = db_name or (cfg("MSSQL_DB") or DEFAULT_db)
+    driver = cfg("MSSQL_DRIVER") or DEFAULT_DRIVER
+    user = cfg("MSSQL_USER")
+    pwd = cfg("MSSQL_PASS")
+
+    extra = cfg("MSSQL_EXTRA_PARAMS")
+    if extra:
+        extra = extra.strip().strip(";") + ";"
+    else:
+        extra = "TrustServerCertificate=yes;"
 
     if user and pwd:
-        odbc_str = (
-            f"DRIVER={{{driver_name}}};"
-            f"SERVER={server};DATABASE={default_db};UID={user};PWD={pwd};"
+        odbc = (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={server};DATABASE={dbName};"
+            f"UID={user};PWD={pwd};{extra}"
         )
     else:
-        odbc_str = (
-            f"DRIVER={{{driver_name}}};"
-            f"SERVER={server};DATABASE={default_db};Trusted_Connection=yes;"
+        odbc = (
+            f"DRIVER={{{driver}}};"
+            f"SERVER={server};DATABASE={dbName};"
+            f"Trusted_Connection=yes;{extra}"
         )
 
-    return "mssql+pyodbc:///?odbc_connect=" + quote_plus(odbc_str)
+    return "mssql+pyodbc:///?odbc_connect=" + quote_plus(odbc)
 
 
-def connect_to_server(db_name: str | None = None):
-    """
-    Returns a SQLAlchemy engine:
-      - mssql mode -> engine connected to MSSQL server 'master' (or configured default DB)
-      - sqlite fallback -> engine pointed at existing CONFIG_DB (only if present)
-    No database creation or modification is performed here.
-    """
-    mode = get_db_mode()
-    if mode == "mssql":      
-        
-        conn_str = _build_mssql_conn_str(db_name)
-        
-        engine = create_engine(conn_str, pool_timeout=30, pool_recycle=3600)
-        # basic smoke test
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-        except Exception as e:
-            logger.error(f"MS SQL connect test failed: {e}")
-            raise
-        logger.info(f"Connected to MSSQL server { (get_config_value('MSSQL_SERVER') or DEFAULT_MSSQL_SERVER) } (db=master)")
-        return engine
-
-    # sqlite fallback only if file exists
-    if os.path.exists(CONFIG_DB):
-        uri = f"sqlite:///{CONFIG_DB}"
-        engine = create_engine(uri, connect_args={"check_same_thread": False})
-        return engine
-
-    raise RuntimeError("No valid database configuration found (DB_MODE not 'mssql' and sample.db missing)")
-
-
-def connect_to_database(db_name: str):
-    """
-    Return engine to a specific database name:
-      - mssql: returns engine targetting the requested database name on the server
-      - sqlite: returns engine if CONFIG_DB exists
-    """
-    mode = get_db_mode()
-    if mode == "mssql":
-        _safe_identifier(db_name)
-        conn_str = _build_mssql_conn_str(db_name)
-        engine = create_engine(conn_str, pool_timeout=30, pool_recycle=3600)
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-        except Exception as e:
-            logger.error(f"MS SQL connect to DB '{db_name}' failed: {e}")
-            raise
-        logger.info(f"Connected to MSSQL database: {db_name}")
-        return engine
-
-    # sqlite fallback only if file exists
-    if os.path.exists(CONFIG_DB):
-        return connect_to_server()
-
-    raise RuntimeError("SQLite DB not found and DB_MODE is not mssql.")
- 
-# ─── ROUTES ────────────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
+def db_engine(dbName: str):
+    connStr = mk_conn_str(dbName)
+    eng = create_engine(connStr, pool_timeout=30, pool_recycle=3600)
     try:
-        return render_template("index.html")
-    except Exception:
-        return "Row count validation API is running."
+        with eng.connect() as c:
+            c.execute(text("SELECT 1"))
+    except Exception as ex:
+        log.error("SQL Server connection failed: %s", ex)
+        raise
+    return eng
 
 
-@app.route("/api/databases", methods=["GET"])
-def get_databases_endpoint():
-    """
-    For mssql mode: return server databases.
-    For sqlite fallback: return filename as logical DB.
-    """
-    try:
-        mode = get_db_mode()
-        if mode == "mssql":
-            engine = connect_to_server()
-            query = "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0"
-            with engine.connect() as conn:
-                df = pd.read_sql(query, conn)
-            return jsonify(df['name'].tolist())
-        else:
-            return jsonify([os.path.basename(CONFIG_DB)])
-    except Exception as e:
-        logger.error(f"Error fetching databases: {e}")
-        return jsonify({"error": str(e)}), 500
+def split_table(full_name: str):
+    if "." in full_name:
+        schema, table = full_name.split(".", 1)
+        return schema, table
+    return "dbo", full_name
 
 
-@app.route("/api/tables", methods=["POST"])
-def get_tables_endpoint():
-    """
-    For mssql: given a database name (posted), return its table names.
-    For sqlite fallback: list tables from sqlite_master (only if file exists).
-    """
-    try:
-        data = request.get_json()
-        if not data or "database" not in data:
-            return jsonify({"error": "Database name is required"}), 400
-
-        mode = get_db_mode()
-        posted_db = data["database"]
-
-        if mode == "mssql":
-            engine = connect_to_database(posted_db)
-            inspector = inspect(engine)
-            # Get all schemas
-            schemas = inspector.get_schema_names()
-            # Fetch tables for each schema
-            all_tables = []
-            for schema in schemas:
-                for table in inspector.get_table_names(schema=schema):
-                    all_tables.append(f"{schema}.{table}")
-
-            return jsonify(all_tables)
-        else:
-            if not os.path.exists(CONFIG_DB):
-                return jsonify({"error": "SQLite DB not available"}), 500
-            engine = connect_to_server()
-            query = """
-              SELECT name
-                FROM sqlite_master
-               WHERE type = 'table'
-                 AND name NOT LIKE 'sqlite_%'
-               ORDER BY name
-            """
-            df = pd.read_sql(query, engine)
-            return jsonify(df["name"].tolist())
-
-    except Exception as e:
-        logger.error(f"Error fetching tables: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/columns", methods=["POST"])
-def get_columns_endpoint():
-    """
-    Given {"table": "<table_name>"} return column list for that table.
-    """
-    try:
-        data = request.get_json()
-        table = data.get("table")
-        if not table:
-            return jsonify({"error": "table is required"}), 400
-        engine = connect_to_server()
-        inspector = inspect(engine)
-        cols = inspector.get_columns(table)
-        return jsonify([c["name"] for c in cols])
-    except Exception as e:
-        logger.error(f"Error fetching columns: {e}")
-        return jsonify({"error": str(e)}), 500
-
-def extract_count_column(prompt: str, source_col):
-    """
-    Detects count column and DISTINCT intent from free text.
-
-    Special rules:
-    - NULL checks ALWAYS return (None, False) → COUNT(*)
-    - DISTINCT handled only when explicitly requested
-    """
-
-    lower_prompt = (
+def find_count_col(prompt: str, cols):
+    txt = (
         prompt.lower()
         .replace("(", " ")
         .replace(")", " ")
         .replace(",", " ")
     )
 
-    colnames = [c["name"].lower() for c in source_col]
-    tokens = lower_prompt.split()
+    colnames = [c["name"].lower() for c in cols]
+    tokens = txt.split()
 
-    # -------------------------------------------------
-    # 1️⃣ NULL CHECK DETECTION → FORCE COUNT(*)
-    # -------------------------------------------------
-    null_keywords = {"null", "is null", "missing", "blank", "empty"}
-
-    if any(k in lower_prompt for k in null_keywords):
-        # Never count a column for NULL checks
+    null_words = {"null", "is null", "missing", "blank", "empty"}
+    if any(k in txt for k in null_words):
         return None, False
 
-    # -------------------------------------------------
-    # 2️⃣ DISTINCT DETECTION
-    # -------------------------------------------------
-    is_distinct = "distinct" in tokens
+    isDistinct = "distinct" in tokens
 
-    # -------------------------------------------------
-    # 3️⃣ Explicit patterns: "count <column>"
-    # -------------------------------------------------
     if "count" in tokens:
         idx = tokens.index("count")
         lookahead = tokens[idx + 1 : idx + 4]
 
-        joined_variants = []
+        joined = []
         for i in range(len(lookahead)):
             for j in range(i + 1, len(lookahead)):
-                joined_variants.append(lookahead[i] + lookahead[j])
-                joined_variants.append(lookahead[i] + "_" + lookahead[j])
+                joined.append(lookahead[i] + lookahead[j])
+                joined.append(lookahead[i] + "_" + lookahead[j])
 
-        for token in lookahead + joined_variants:
+        for token in lookahead + joined:
             if token in colnames:
-                return token, is_distinct
+                return token, isDistinct
 
-    # -------------------------------------------------
-    # 4️⃣ Pattern: "count of <column>"
-    # -------------------------------------------------
     for col in colnames:
-        if f"count of {col}" in lower_prompt:
-            return col, is_distinct
+        if f"count of {col}" in txt:
+            return col, isDistinct
 
-    # -------------------------------------------------
-    # 5️⃣ NO COLUMN FOUND → COUNT(*)
-    # -------------------------------------------------
-    return None, is_distinct
+    return None, isDistinct
 
-def extract_compound_columns(prompt: str, source_col):
-    """
-    Extract multiple columns for compound unique checks.
-    Example prompts:
-      - check unique combination of email and hire_date
-      - ensure email, hire_date is unique
-      - compound unique email hire_date
-    """
-    lower_prompt = prompt.lower().replace(",", " ").replace("(", " ").replace(")", " ")
-    tokens = lower_prompt.split()
 
-    colnames = {c["name"].lower(): c["name"] for c in source_col}
-
-    found = []
-    for token in tokens:
-        if token in colnames and token not in found:
-            found.append(colnames[token])
-
-    # Compound unique requires 2+ columns
-    return found if len(found) >= 2 else []
-
-# ------------------------------------------------------------
-#   SQL SANITIZER – Removes invalid datatype comparisons
-# ------------------------------------------------------------
-def sanitize_sql(sql: str, source_col):
-    type_map = {c["name"].lower(): str(c["type"]).lower() for c in source_col}
-    sql_lower = sql.lower()
-
-    if " where " not in sql_lower:
+def scrub_sql(sql: str, cols):
+    typeMap = {c["name"].lower(): str(c["type"]).lower() for c in cols}
+    match = re.search(r"\bwhere\b", sql, re.IGNORECASE)
+    if not match:
         return sql
 
-    before_where, where_part = sql.split("WHERE", 1)
-    where_part = where_part.strip().rstrip(";")
+    before_where = sql[:match.end()]
+    where_part = sql[match.end():].strip().rstrip(";")
 
-    if where_part == "1=1":
+    if where_part.lower() == "1=1":
         return sql
 
-    safe_conditions = []
-    conditions = [c.strip() for c in where_part.split(" OR ")]
+    parts = re.split(r"\s+OR\s+", where_part, flags=re.IGNORECASE)
+    good = []
 
-    for cond in conditions:
+    for cond in parts:
+        cond = cond.strip()
         if not cond:
             continue
 
-        # Extract left column
-        left = cond.split()[0].replace("LOWER(", "").replace(")", "")
+        left = cond.split()[0]
+        left = left.replace("LOWER(", "").replace("UPPER(", "").replace(")", "")
+        left = left.split(".")[-1]
+        left = left.strip("[]")
         col = left.lower()
 
-        if col not in type_map:
+        if col not in typeMap:
             continue
 
-        col_type = type_map[col]
+        colType = typeMap[col]
 
-        # Extract right side value
-        if "=" in cond:
-            right = cond.split("=", 1)[1].strip().strip("'")
-        elif "!=" in cond:
+        if re.search(r"\bbetween\b|\blike\b|\bin\b", cond, re.IGNORECASE):
+            good.append(cond)
+            continue
+
+        if "!=" in cond:
             right = cond.split("!=", 1)[1].strip().strip("'")
+        elif "=" in cond:
+            right = cond.split("=", 1)[1].strip().strip("'")
         else:
-            safe_conditions.append(cond)
+            good.append(cond)
             continue
 
-        # numeric
-        if any(t in col_type for t in ["int", "decimal", "numeric"]):
+        if any(t in colType for t in ["int", "decimal", "numeric", "float", "real", "money", "bigint", "smallint", "tinyint"]):
             if not right.replace(".", "", 1).isdigit():
-                logger.warning(f"❌ Removed invalid numeric condition: {cond}")
+                log.warning("Removed invalid numeric condition: %s", cond)
                 continue
 
-        # date
-        if "date" in col_type:
-            if not (len(right) == 10 and right[4] == "-" and right[7] == "-"):
-                logger.warning(f"❌ Removed invalid date condition: {cond}")
+        if "date" in colType or "time" in colType:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}", right):
+                log.warning("Removed invalid date condition: %s", cond)
                 continue
 
-        safe_conditions.append(cond)
+        good.append(cond)
 
-    if not safe_conditions:
-        return before_where + "WHERE 1=1;"
+    if not good:
+        return before_where + " 1=1;"
 
-    return before_where + "WHERE " + " OR ".join(safe_conditions) + ";"
+    return before_where + " " + " OR ".join(good) + ";"
 
-# ------------------------------------------------------------
-#   MAIN QUERY BUILDER
-# ------------------------------------------------------------
-def generate_where_clause(prompt: str, source_db: str, source_table: str, source_col):
-    """
-    Generates SQL:
-      - COUNT(*) / COUNT(col) / COUNT(DISTINCT col)
-      - WHERE clause for ALL supported DQ checks
-    """
-    try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        openai.api_key = api_key
 
-        # ---------- COUNT COLUMN ----------
-        count_col, is_distinct = extract_count_column(prompt, source_col)
+def pick_where(sql: str) -> str | None:
+    m = re.search(r"\bwhere\b", sql, re.IGNORECASE)
+    if not m:
+        return None
+    clause = sql[m.start():].strip().rstrip(";")
+    if not clause.lower().startswith("where"):
+        clause = "WHERE " + clause
+    return clause
 
-        if count_col:
-            count_expr = (
-                f"COUNT(DISTINCT {count_col}) AS row_count"
-                if is_distinct else
-                f"COUNT({count_col}) AS row_count"
-            )
-        else:
-            count_expr = "COUNT(*) AS row_count"
 
-        # -------------------------------------------------
-        # 1️⃣ COMPOUND UNIQUE CHECK (SQL SERVER SAFE)
-        # -------------------------------------------------
-        compound_cols = extract_compound_columns(prompt, source_col)
+def build_count_sql(prompt: str, db: str, schema: str, table: str, cols):
+    count_col, isDistinct = find_count_col(prompt, cols)
+    if count_col:
+        col_ref = f"[{count_col}]"
+        count_expr = f"COUNT(DISTINCT {col_ref})" if isDistinct else f"COUNT({col_ref})"
+    else:
+        count_expr = "COUNT(*)"
 
-        if compound_cols:
-            group_cols = ", ".join(compound_cols)
-            join_conditions = " AND ".join(
-                [f"t.{c} = d.{c}" for c in compound_cols]
-            )
+    base_tbl = tbl_ref(db, schema, table)
+    base = f"SELECT {count_expr} AS row_count FROM {base_tbl}"
 
-            return f"""
-            SELECT COUNT(*) AS row_count
-            FROM {source_db}.{source_table} t
-            JOIN (
-                SELECT {group_cols}
-                FROM {source_db}.{source_table}
-                GROUP BY {group_cols}
-                HAVING COUNT(*) > 1
-            ) d
-            ON {join_conditions};
-            """
+    client = llm_client()
+    if not client:
+        return base + " WHERE 1=1;"
 
-        # ---------- GPT PROMPT (FIXED) ----------
-        system_prompt = (
-            "You are an expert SQL data quality assistant. "
-            "You ALWAYS generate a WHERE clause when the user provides any condition."
-        )
+    col_lines = "\n".join([f"- {c['name']} ({c['type']})" for c in cols])
+    sys_msg = "You are an expert SQL Server data quality assistant."
+    user_msg = f"""Create ONE SQL Server query based on the user prompt.
 
-        user_prompt = f"""
-Generate ONE valid SQL query.
+Base query:
+{base}
 
-BASE QUERY:
-SELECT {count_expr}
-FROM {source_db}.{source_table}
+Rules:
+- Return ONLY SQL, end with semicolon.
+- Use ONLY the columns listed.
+- Do not change the base table or database.
+- If no filter is implied, use WHERE 1=1.
+- Strings must be single-quoted.
+- For case-insensitive comparisons, use LOWER(column) and lowercase values.
 
-SUPPORTED CHECKS (ALWAYS APPLY WHEN IMPLIED):
-- Null check → column IS NULL
-- Range check → BETWEEN
-- Validity check → IN (...)
-- Format check → LIKE
-- Default check → column = value
-- Custom filter → exact SQL condition
-- Unique checks → COUNT(DISTINCT ...)
+Columns:
+{col_lines}
 
-SCHEMA (ONLY USE THESE COLUMNS):
-{chr(10).join([f"- {c['name']} ({c['type']})" for c in source_col])}
-
-RULES:
-- Output ONLY SQL
-- End with semicolon
-- Never hallucinate columns
-- Strings → LOWER()
-- IN values → lowercase
-- If unclear → WHERE 1=1
-
-USER CONDITION:
+User prompt:
 {prompt}
 """
 
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+    try:
+        resp = client.chat.completions.create(
+            model=cfg("OPENAI_MODEL") or DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
             ],
             temperature=0,
-            max_tokens=250
+            max_tokens=300
         )
-
-        sql_out = response.choices[0].message.content.strip()
-
-        # ---------- CLEANUP ----------
+        sql_out = resp.choices[0].message.content.strip()
         sql_out = sql_out.replace("```sql", "").replace("```", "").strip()
         sql_out = re.sub(r"\b(source|target)\.", "", sql_out, flags=re.IGNORECASE)
+        where_clause = pick_where(sql_out) or "WHERE 1=1"
+        full_sql = f"{base} {where_clause};"
+        return scrub_sql(full_sql, cols)
+    except Exception as ex:
+        log.error("Query generation error: %s", ex)
+        return base + " WHERE 1=1;"
 
-        # ---------- SAFETY ----------
-        sql_out = sanitize_sql(sql_out, source_col)
 
-        return sql_out
-
-    except Exception as e:
-        logger.error(f"generate_where_clause error: {e}")
-        return f"SELECT COUNT(*) AS row_count FROM {source_db}.{source_table} WHERE 1=1;"
-
-def get_row_count(engine, table_name, where_clause):
-    """
-    Use DB-specific quoting for table name:
-      - mssql : [table]
-      - sqlite: "table"
-    """
-    mode = get_db_mode()
-    _safe_identifier(table_name)
-    if mode == "mssql":
-        q = where_clause
-    else:
-        q = where_clause
-    with engine.connect() as conn:
-        result = conn.execute(text(q))
-        val = result.scalar()
+def run_count(eng, sql: str) -> int:
+    with eng.connect() as c:
+        val = c.execute(text(sql)).scalar()
         return int(val or 0)
 
-def generate_simple_summary(source_count, target_count, is_anomaly):
-    if source_count == target_count:
-        return f"Perfect match: both have {source_count} rows."
-    diff = abs(source_count - target_count)
-    pct = (diff / max(source_count, target_count)) * 100 if max(source_count, target_count) else 0
+
+def basic_summary(src_cnt: int, tgt_cnt: int) -> str:
+    if src_cnt == tgt_cnt:
+        return f"Perfect match: both have {src_cnt} rows."
+    diff = abs(src_cnt - tgt_cnt)
+    pct = (diff / max(src_cnt, tgt_cnt)) * 100 if max(src_cnt, tgt_cnt) else 0
     status = "significant discrepancy" if pct > 5 else "minor difference"
-    anomaly = " Possible anomaly." if is_anomaly else ""
-    return f"Row count mismatch: {diff} rows difference ({pct:.1f}% {status}).{anomaly}"
+    return f"Row count mismatch: {diff} rows difference ({pct:.1f}% {status})."
 
 
-def generate_summary(source_count, target_count, source_query,target_query):
-    """
-    Uses OpenAI GPT-4o-mini to generate a data quality summary.
-    Falls back to generate_simple_summary if API key not set or error occurs.
-    """
+def llm_summary(prompt: str, src_cnt: int, tgt_cnt: int, src_sql: str, tgt_sql: str) -> str:
+    client = llm_client()
+    if not client:
+        return basic_summary(src_cnt, tgt_cnt)
+
+    diff = abs(src_cnt - tgt_cnt)
+    pct = (diff / max(src_cnt, tgt_cnt)) * 100 if max(src_cnt, tgt_cnt) else 0
+
+    sys_msg = "You are a data quality analyst. Write concise, actionable summaries."
+    user_msg = f"""Write a 4-5 sentence validation report.
+
+User prompt:
+{prompt}
+
+Source row count: {src_cnt}
+Target row count: {tgt_cnt}
+Difference: {diff}
+Percent difference: {pct:.2f}%
+
+Source query:
+{src_sql}
+
+Target query:
+{tgt_sql}
+"""
+
     try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            logger.debug("OPENAI_API_KEY not found. Using fallback summary.")
-            return generate_simple_summary(source_count, target_count)
-
-        openai.api_key = api_key
-
-        system_prompt = "You are a data quality analyst. Write clear, concise summaries for data engineering reports."
-        user_prompt = f"""
-        Analyze the following row count validation details and write a clear 4–5 sentence summary for a data engineering report:
-
-        - Source Row Count: {source_count}
-        - Target Row Count: {target_count}
-        - Filter Applied (Source Query): {source_query}
-        - Filter Applied (target Query): {target_query}
-        """
-
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = client.chat.completions.create(
+            model=cfg("OPENAI_MODEL") or DEFAULT_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg}
             ],
             temperature=0,
             max_tokens=250
         )
+        return resp.choices[0].message.content.strip()
+    except Exception as ex:
+        log.error("Summary generation error: %s", ex)
+        return basic_summary(src_cnt, tgt_cnt)
 
-        summary = response.choices[0].message.content.strip()
-        return summary
 
-    except Exception as e:
-        logger.error(f"OpenAI GPT summary error: {e}")
-        return generate_simple_summary(source_count, target_count)
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-def split_schema_table(full_table_name):
-    if '.' in full_table_name:
-        parts = full_table_name.split('.', 1)
-        return parts[0], parts[1]  # schema, table
-    else:
-        return 'dbo', full_table_name
 
-# ─── VALIDATE ENDPOINT ─────────────────────────────────────────────────────────
+@app.route("/api/databases", methods=["GET"])
+def get_dbs():
+    try:
+        eng = db_engine("master")
+        query = "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 ORDER BY name"
+        with eng.connect() as c:
+            rows = c.execute(text(query)).fetchall()
+        return jsonify([r[0] for r in rows])
+    except Exception as ex:
+        log.error("Error fetching databases: %s", ex)
+        return jsonify({"error": str(ex)}), 500
+
+
+@app.route("/api/tables", methods=["POST"])
+def tables_for_db():
+    try:
+        data = request.get_json() or {}
+        dbName = data.get("database")
+        if not dbName:
+            return jsonify({"error": "database is required"}), 400
+
+        eng = db_engine(dbName)
+        insp = inspect(eng)
+        tables = []
+        for schema in insp.get_schema_names():
+            for table in insp.get_table_names(schema=schema):
+                tables.append(f"{schema}.{table}")
+        tables.sort()
+        return jsonify(tables)
+    except Exception as ex:
+        log.error("Error fetching tables: %s", ex)
+        return jsonify({"error": str(ex)}), 500
+
+
 @app.route("/api/validate", methods=["POST"])
 def validate():
     try:
-        data = request.get_json()
-
-        # ------------------ REQUIRED FIELDS ------------------
-        required = ["source_db", "target_db", "prompt", "mappings"]
+        data = request.get_json() or {}
+        required = ["source_db", "target_db", "source_table", "target_table", "prompt"]
         for f in required:
             if not data.get(f):
                 return jsonify({"error": f"Missing field: {f}"}), 400
 
-        source_db = data["source_db"]
-        target_db = data["target_db"]
-        prompt    = data["prompt"]
-        mappings  = data["mappings"]
+        srcDb = data["source_db"]
+        tgtDb = data["target_db"]
+        srcTable = data["source_table"]
+        tgtTable = data["target_table"]
+        prompt = data["prompt"]
 
-        if not isinstance(mappings, list) or len(mappings) == 0:
-            return jsonify({"error": "No table mappings provided"}), 400
+        src_eng = db_engine(srcDb)
+        tgt_eng = db_engine(tgtDb)
 
-        results = []
+        src_schema, src_name = split_table(srcTable)
+        tgt_schema, tgt_name = split_table(tgtTable)
 
-        # ------------------ CONNECT ONCE (IMPORTANT) ------------------
-        src_engine = connect_to_database(source_db)
-        tgt_engine = connect_to_database(target_db)
+        src_cols = inspect(src_eng).get_columns(src_name, schema=src_schema)
+        if not src_cols:
+            return jsonify({"error": f"Source table '{srcTable}' not found in '{srcDb}'"}), 400
 
-        src_inspect = inspect(src_engine)
-        tgt_inspect = inspect(tgt_engine)
+        tgt_cols = inspect(tgt_eng).get_columns(tgt_name, schema=tgt_schema)
+        if not tgt_cols:
+            return jsonify({"error": f"Target table '{tgtTable}' not found in '{tgtDb}'"}), 400
 
-        # ------------------ PROCESS EACH MAPPING ------------------
-        for idx, mapping in enumerate(mappings, start=1):
+        src_sql = build_count_sql(prompt, srcDb, src_schema, src_name, src_cols)
+        tgt_sql = build_count_sql(prompt, tgtDb, tgt_schema, tgt_name, tgt_cols)
 
-            s_table = mapping.get("source_table")
-            t_table = mapping.get("target_table")
+        src_cnt = run_count(src_eng, src_sql)
+        tgt_cnt = run_count(tgt_eng, tgt_sql)
 
-            if not s_table or not t_table:
-                return jsonify({
-                    "error": f"Invalid mapping at index {idx}"
-                }), 400
+        diff = abs(src_cnt - tgt_cnt)
+        pct = (diff / max(src_cnt, tgt_cnt)) * 100 if max(src_cnt, tgt_cnt) else 0.0
+        is_match = src_cnt == tgt_cnt
 
-            # ---- Split schema.table ----
-            s_schema, s_name = split_schema_table(s_table)
-            t_schema, t_name = split_schema_table(t_table)
+        summary = llm_summary(prompt, src_cnt, tgt_cnt, src_sql, tgt_sql)
 
-            # ------------------ SOURCE ------------------
-            try:
-                src_cols = src_inspect.get_columns(s_name, schema=s_schema)
-            except Exception:
-                return jsonify({
-                    "error": f"Source table '{s_table}' not found in database '{source_db}'"
-                }), 400
-
-            src_query = generate_where_clause(
-                prompt=prompt,
-                source_db=source_db,
-                source_table=s_table,
-                source_col=src_cols
-            )
-
-            src_count = get_row_count(src_engine, s_name, src_query)
-
-            # ------------------ TARGET ------------------
-            try:
-                tgt_cols = tgt_inspect.get_columns(t_name, schema=t_schema)
-            except Exception:
-                return jsonify({
-                    "error": f"Target table '{t_table}' not found in database '{target_db}'"
-                }), 400
-
-            tgt_query = generate_where_clause(
-                prompt=prompt,
-                source_db=target_db,
-                source_table=t_table,
-                source_col=tgt_cols
-            )
-
-            tgt_count = get_row_count(tgt_engine, t_name, tgt_query)
-
-            # ------------------ SUMMARY ------------------
-            summary = generate_summary(
-                source_count=src_count,
-                target_count=tgt_count,
-                source_query=src_query,
-                target_query=tgt_query
-            )
-
-            results.append({
-                "source_table": s_table,
-                "target_table": t_table,
-                "source_count": src_count,
-                "target_count": tgt_count,
-                "source_query": src_query,
-                "target_query": tgt_query,
+        return jsonify({
+            "result": {
+                "source_db": srcDb,
+                "target_db": tgtDb,
+                "source_table": f"{src_schema}.{src_name}",
+                "target_table": f"{tgt_schema}.{tgt_name}",
+                "source_count": src_cnt,
+                "target_count": tgt_cnt,
+                "diff": diff,
+                "pct_diff": round(pct, 2),
+                "is_match": is_match,
+                "source_query": src_sql,
+                "target_query": tgt_sql,
                 "summary": summary
-            })
+            }
+        })
+    except Exception:
+        log.error(traceback.format_exc())
+        return jsonify({"error": "Unexpected server error"}), 500
 
-        return jsonify({"results": results})
 
-    except Exception as e:
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-# ─── ERROR HANDLERS ────────────────────────────────────────────────────────────
 @app.errorhandler(404)
 def nf(e):
-    return jsonify({"error":"Not found"}), 404
+    return jsonify({"error": "Not found"}), 404
+
 
 @app.errorhandler(500)
 def ie(e):
-    return jsonify({"error":"Server error"}), 500
+    return jsonify({"error": "Server error"}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
