@@ -8,6 +8,3 @@ Quick start
 3. Run the app: `python app.py`.
 4. Open `http://localhost:5000` in your browser.
 
-Notes
-- Windows authentication is used when `MSSQL_USER` and `MSSQL_PASS` are not set.
-- Default database is `AdventureWorks2022`.
