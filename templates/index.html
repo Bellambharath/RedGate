@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GenAI Row Count Validator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+  <div class="app-bg">
+    <div class="container card">
+
+      <h1>🤖 GenAI Row Count Validator</h1>
+
+      <!-- DB SELECTION -->
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Source DB</label>
+          <select id="sourceDb">
+            <option value="">Select Source DB</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Target DB</label>
+          <select id="targetDb">
+            <option value="">Select Target DB</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- TABLE BROWSER -->
+      <div class="table-browser">
+        <div class="table-grid">
+          <div>
+            <h3>📂 Source Tables</h3>
+            <p class="muted">Click to copy</p>
+            <div id="sourceTableList" class="table-list"></div>
+          </div>
+      
+          <div>
+            <h3>📂 Target Tables</h3>
+            <p class="muted">Click to copy</p>
+            <div id="targetTableList" class="table-list"></div>
+          </div>
+        </div>
+      </div>
+      
+
+      <!-- PROMPT -->
+      <label for="prompt">Validation Condition</label>
+      <textarea id="prompt" rows="4"
+        placeholder="e.g. Compare dbo.employees and dbo.country where date_of_birth is null">
+      </textarea>
+
+      <!-- SUBMIT -->
+      <button id="submitBtn" class="primary-btn">🚀 Validate Row Counts</button>
+
+      <!-- RESULTS -->
+      <div id="resultSection">
+        <div id="resultPlaceholder" class="muted">Results will appear here</div>
+        <div id="resultContent"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- JS -->
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
