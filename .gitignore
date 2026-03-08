@@ -1,0 +1,25 @@
+# Ignore virtual environments
+venv/
+Lib/
+Scripts/
+Include/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+
+# Ignore SQLite database files
+*.db
+*.sqlite3
+
+# Ignore VS Code settings and logs
+.vscode/
+*.log
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
